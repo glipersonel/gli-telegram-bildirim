@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -21,6 +22,14 @@ def _required_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Eksik ortam değişkeni: {name}")
     return value
+
+
+def _bot_token() -> str:
+    """Tokeni kullanmadan önce doğrular; hatalarda tokeni loglara yazdırmaz."""
+    token = _required_env("TELEGRAM_BOT_TOKEN")
+    if not re.fullmatch(r"\d{5,}:[A-Za-z0-9_-]{20,}", token):
+        raise RuntimeError("TELEGRAM_BOT_TOKEN biçimi geçersiz")
+    return token
 
 
 def _authorized() -> bool:
@@ -42,22 +51,25 @@ def _remember_once(event_id: str) -> bool:
     return True
 
 
-def _telegram_send(text: str) -> dict:
-    token = _required_env("TELEGRAM_BOT_TOKEN")
-    chat_id = _required_env("TELEGRAM_TEST_CHAT_ID")
-    payload = json.dumps({
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": True,
-    }, ensure_ascii=False).encode("utf-8")
+def _telegram_call(method: str, data: dict) -> dict:
+    token = _bot_token()
+    payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
-        f"https://api.telegram.org/bot{token}/sendMessage",
+        f"https://api.telegram.org/bot{token}/{method}",
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=15) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _telegram_send(text: str) -> dict:
+    return _telegram_call("sendMessage", {
+        "chat_id": _required_env("TELEGRAM_TEST_CHAT_ID"),
+        "text": text,
+        "disable_web_page_preview": True,
+    })
 
 
 @app.get("/")
@@ -89,6 +101,50 @@ def notify():
         _recent_events.pop(event_id, None)
         return jsonify(ok=False, error=str(exc)), 502
     return jsonify(ok=bool(result.get("ok")), test_mode=True)
+
+
+@app.get("/updates")
+def updates():
+    """Telegram mesajlarını yalnız TEST hesabı için V1.82'ye aktarır."""
+    if not _authorized():
+        return jsonify(ok=False, error="unauthorized"), 401
+    try:
+        offset = max(0, int(request.args.get("offset", "0")))
+    except ValueError:
+        return jsonify(ok=False, error="invalid_offset"), 400
+    try:
+        result = _telegram_call("getUpdates", {
+            "offset": offset,
+            "limit": 50,
+            "timeout": 0,
+            "allowed_updates": ["message"],
+        })
+    except (RuntimeError, urllib.error.URLError, TimeoutError, ValueError):
+        return jsonify(ok=False, error="telegram_updates_failed"), 502
+
+    test_chat_id = _required_env("TELEGRAM_TEST_CHAT_ID")
+    temiz = []
+    next_offset = offset
+    for update in result.get("result", []):
+        update_id = int(update.get("update_id", 0))
+        next_offset = max(next_offset, update_id + 1)
+        message = update.get("message") or {}
+        chat = message.get("chat") or {}
+        if str(chat.get("id", "")) != test_chat_id:
+            continue
+        sender = message.get("from") or {}
+        text = str(message.get("text", "")).strip()
+        if not text:
+            continue
+        temiz.append({
+            "update_id": update_id,
+            "chat_id": str(chat.get("id", "")),
+            "text": text[:2000],
+            "username": str(sender.get("username", ""))[:80],
+            "first_name": str(sender.get("first_name", ""))[:80],
+            "date": int(message.get("date", 0)),
+        })
+    return jsonify(ok=True, updates=temiz, next_offset=next_offset, test_mode=True)
 
 
 if __name__ == "__main__":
